@@ -286,6 +286,14 @@
       },
       "next_reminder": {
         "name": "Next reminder"
+      },
+      "echo_light": {
+        "name": "Light level (raw)"
+      }
+    },
+    "binary_sensor": {
+      "motion": {
+        "name": "Motion"
       }
     }
   },

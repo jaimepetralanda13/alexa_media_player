@@ -102,6 +102,7 @@ from .const import (
     STARTUP_MESSAGE,
 )
 from .coordinator import AlexaMediaCoordinator
+from .echo_sensor import get_enabled_echo_entities
 from .exceptions import TimeoutException
 from .helpers import (
     _catch_login_errors,
@@ -812,6 +813,8 @@ async def async_setup_entry(hass, config_entry):
                 "light": [],
                 "binary_sensor": [],
                 "temperature": [],
+                "motion": [],
+                "illuminance": [],
                 "smart_switch": [],
             },
             "entities": {
@@ -1125,7 +1128,7 @@ async def setup_alexa(hass, config_entry, login_obj: AlexaLogin):
         if new_devices:
             tasks.append(AlexaAPI.get_authentication(login_obj))
 
-        entities_to_monitor = set()
+        entities_to_monitor = get_enabled_echo_entities(account)
 
         # Temperature sensors (stored as entities["sensor"][serial]["Temperature"] = sensor)
         for per_serial in hass.data[DATA_ALEXAMEDIA]["accounts"][email]["entities"][
@@ -1269,7 +1272,14 @@ async def setup_alexa(hass, config_entry, login_obj: AlexaLogin):
                         for type_of_entity, entities in alexa_entities.items():
                             if (
                                 type_of_entity
-                                in {"guard", "temperature", "air_quality", "aiaqm"}
+                                in {
+                                    "guard",
+                                    "temperature",
+                                    "air_quality",
+                                    "aiaqm",
+                                    "motion",
+                                    "illuminance",
+                                }
                                 or extended_entity_discovery
                             ):
                                 for entity in entities:

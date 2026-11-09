@@ -9,6 +9,7 @@ https://community.home-assistant.io/t/echo-devices-alexa-as-media-player-testers
 
 import datetime
 import logging
+import math
 from typing import Callable, ClassVar, Optional
 
 from homeassistant.components.sensor import (
@@ -50,6 +51,7 @@ from .const import (
     RECURRING_PATTERN,
     RECURRING_PATTERN_ISO_SET,
 )
+from .echo_sensor import EchoSensor, get_echo_client
 from .helpers import add_devices, alarm_just_dismissed, is_http2_enabled, safe_get
 
 _LOGGER = logging.getLogger(__name__)
@@ -140,6 +142,19 @@ async def async_setup_platform(hass, config, add_devices_callback, discovery_inf
             account_dict, temperature_entities, debug=debug
         )
 
+    echo_light_sensors = []
+    for details in safe_get(account_dict, ["devices", "illuminance"], []):
+        if (client := get_echo_client(account_dict, details)) is None:
+            continue
+        per_serial = account_dict["entities"]["sensor"].setdefault(
+            details["device_serial"], {}
+        )
+        if "Illuminance" in per_serial:
+            continue
+        light_sensor = EchoLightSensor(account_dict["coordinator"], details, client)
+        per_serial["Illuminance"] = light_sensor
+        echo_light_sensors.append(light_sensor)
+
     # AQM Sensors
     air_quality_sensors = []
     aiaqm_entities = safe_get(account_dict, ["devices", "aiaqm"], [])
@@ -148,13 +163,22 @@ async def async_setup_platform(hass, config, add_devices_callback, discovery_inf
             account_dict, aiaqm_entities, debug=debug
         )
 
-    return await add_devices(
+    result = await add_devices(
         hide_email(account),
         devices + temperature_sensors + air_quality_sensors,
         add_devices_callback,
         include_filter,
         exclude_filter,
     )
+    if echo_light_sensors:
+        # Their media players already enforce account include/exclude filters.
+        result = (
+            await add_devices(
+                hide_email(account), echo_light_sensors, add_devices_callback
+            )
+            and result
+        )
+    return result
 
 
 async def async_setup_entry(hass, config_entry, async_add_devices):
@@ -336,6 +360,47 @@ def lookup_device_info(account_dict, device_serial):
             for ident in mediaplayer.device_info["identifiers"]:
                 return ident
     return None
+
+
+class EchoLightSensor(EchoSensor, SensorEntity):
+    """Ambient light reported by an Echo through the shared coordinator."""
+
+    _attr_translation_key = "echo_light"
+    _attr_icon = "mdi:brightness-6"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator, details: dict, client) -> None:
+        """Initialize the sensor using the existing Echo's identity."""
+        super().__init__(coordinator, details["id"], client, "illuminance")
+
+    @property
+    def native_value(self) -> int | float | None:
+        """Return valid numeric readings, including zero, without coercion."""
+        reading = self._reading("Alexa.LightSensor", "illuminance")
+        value = (reading or {}).get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            return None
+        try:
+            if not math.isfinite(value):
+                return None
+        except OverflowError:
+            return None
+        return value
+
+    @property
+    def available(self) -> bool:
+        """Do not mistake missing or malformed light data for darkness."""
+        return super().available and self.native_value is not None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Expose Amazon's sample time and the unverified raw scale."""
+        return {
+            "sample_time": self._sample_time(
+                self._reading("Alexa.LightSensor", "illuminance")
+            ),
+            "unit_note": "Amazon raw value; unit not verified",
+        }
 
 
 class TemperatureSensor(SensorEntity, CoordinatorEntity):

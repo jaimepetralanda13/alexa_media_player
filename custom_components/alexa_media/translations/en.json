@@ -106,6 +106,9 @@
       },
       "temperature": {
         "name": "Temperature"
+      },
+      "echo_light": {
+        "name": "Light level (raw)"
       }
     },
     "switch": {
@@ -123,6 +126,11 @@
       },
       "shuffle": {
         "name": "Shuffle"
+      }
+    },
+    "binary_sensor": {
+      "motion": {
+        "name": "Motion"
       }
     }
   },

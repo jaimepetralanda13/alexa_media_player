@@ -27,6 +27,7 @@ from . import (
 from .alexa_entity import parse_detection_state_from_coordinator
 from .amazon_kids import KIDS_CAPABLE_FAMILIES, async_get_state
 from .const import CONF_EXTENDED_ENTITY_DISCOVERY
+from .echo_sensor import EchoSensor, get_echo_client
 from .helpers import add_devices, safe_get
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,6 +48,21 @@ async def async_setup_platform(hass, config, add_devices_callback, discovery_inf
     exclude_filter = config.get(CONF_EXCLUDE_DEVICES, [])
     coordinator = account_dict["coordinator"]
     binary_entities = safe_get(account_dict, ["devices", "binary_sensor"], [])
+    echo_motion_sensors = []
+    known_motion_ids = {
+        entity.unique_id
+        for entity in account_dict["entities"]["binary_sensor"]
+        if isinstance(entity, EchoMotionSensor)
+    }
+    for details in safe_get(account_dict, ["devices", "motion"], []):
+        if (client := get_echo_client(account_dict, details)) is None:
+            continue
+        motion = EchoMotionSensor(coordinator, details, client)
+        if motion.unique_id in known_motion_ids:
+            continue
+        known_motion_ids.add(motion.unique_id)
+        account_dict["entities"]["binary_sensor"].append(motion)
+        echo_motion_sensors.append(motion)
     if binary_entities and account_dict["options"].get(CONF_EXTENDED_ENTITY_DISCOVERY):
         for binary_entity in binary_entities:
             _LOGGER.debug(
@@ -85,6 +101,14 @@ async def async_setup_platform(hass, config, add_devices_callback, discovery_inf
         include_filter,
         exclude_filter,
     )
+    if echo_motion_sensors:
+        # Their media players already enforce account include/exclude filters.
+        result = (
+            await add_devices(
+                hide_email(account), echo_motion_sensors, add_devices_callback
+            )
+            and result
+        )
     if kids_devices:
         await kids_state.async_start()
         # Already scoped via the media_player entities, so no extra name filter.
@@ -110,6 +134,57 @@ async def async_unload_entry(hass, entry) -> bool:
     for binary_sensor in account_dict["entities"]["binary_sensor"]:
         await binary_sensor.async_remove()
     return True
+
+
+class EchoMotionSensor(EchoSensor, BinarySensorEntity):
+    """Motion reported by the Echo's native presence detection capability."""
+
+    _attr_device_class = BinarySensorDeviceClass.MOTION
+    _attr_translation_key = "motion"
+
+    def __init__(self, coordinator, details: dict, client) -> None:
+        """Initialize the sensor using the existing Echo's identity."""
+        super().__init__(coordinator, details["id"], client, "motion")
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return the reported detection state without inferring vacancy."""
+        reading = self._reading("Alexa.MotionSensor", "detectionState")
+        value = (reading or {}).get("value")
+        if value == "DETECTED":
+            return True
+        if value == "NOT_DETECTED":
+            return False
+        return None
+
+    @property
+    def available(self) -> bool:
+        """Do not expose a missing or unrecognized state as no motion."""
+        enabled = self._reading("Alexa.MotionSensor", "enablement")
+        enablement = (enabled or {}).get("value")
+        return (
+            super().available
+            and self.is_on is not None
+            and not (isinstance(enablement, str) and enablement.upper() == "DISABLED")
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Expose the reported timestamp and settings without inventing units."""
+        attrs = {
+            "sample_time": self._sample_time(
+                self._reading("Alexa.MotionSensor", "detectionState")
+            )
+        }
+        for name, attribute in (
+            ("detectionRange", "detection_range"),
+            ("detectionSensitivity", "detection_sensitivity"),
+            ("enablement", "detection_enabled"),
+        ):
+            reading = self._reading("Alexa.MotionSensor", name)
+            if reading is not None:
+                attrs[attribute] = reading.get("value")
+        return attrs
 
 
 class AlexaContact(CoordinatorEntity, BinarySensorEntity):

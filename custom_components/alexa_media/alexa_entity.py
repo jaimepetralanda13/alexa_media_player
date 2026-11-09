@@ -38,15 +38,23 @@ def has_capability(
         property_name(str): The property that matches the interface name.
 
     """
-    for cap in appliance["capabilities"]:
+    capabilities = appliance.get("capabilities")
+    if not isinstance(capabilities, list):
+        return False
+    for cap in capabilities:
+        if not isinstance(cap, dict):
+            continue
         props = cap.get("properties")
         if (
-            cap["interfaceName"] == interface_name
-            and props
-            and (props["retrievable"] or props["proactivelyReported"])
+            cap.get("interfaceName") == interface_name
+            and isinstance(props, dict)
+            and (props.get("retrievable") or props.get("proactivelyReported"))
         ):
-            for prop in props["supported"]:
-                if prop["name"] == property_name:
+            supported = props.get("supported")
+            if not isinstance(supported, list):
+                continue
+            for prop in supported:
+                if isinstance(prop, dict) and prop.get("name") == property_name:
                     return True
     return False
 
@@ -204,6 +212,27 @@ def get_device_serial(appliance: dict[str, Any]) -> str | None:
     return None
 
 
+def is_echo_sensor(
+    appliance: dict[str, Any], interface_name: str, property_name: str
+) -> bool:
+    """Identify local Echo sensor capabilities, excluding skill-backed devices.
+
+    Platform setup also requires the matching media player in the same account.
+    This prevents a skill or bridged sensor from being attached to an Echo just
+    because its friendly name or capabilities happen to match.
+    """
+    return (
+        not is_skill(appliance)
+        and is_local(appliance)
+        and (
+            "ALEXA_VOICE_ENABLED" in appliance.get("applianceTypes", [])
+            or appliance.get("manufacturerName") == "Amazon"
+        )
+        and bool(get_device_serial(appliance))
+        and has_capability(appliance, interface_name, property_name)
+    )
+
+
 def get_device_bridge(
     appliance: dict[str, Any], appliances: dict[str, dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -249,6 +278,12 @@ class AlexaTemperatureEntity(TypedDict, total=False):
     is_aiaqm: bool
 
 
+class AlexaEchoSensorEntity(AlexaEntity):
+    """A sensor capability attached to a physical Echo."""
+
+    device_serial: str
+
+
 class AlexaAirQualityEntity(AlexaEntity):
     """Class for AlexaAirQualityEntity."""
 
@@ -274,6 +309,8 @@ class AlexaEntities(TypedDict):
     light: list[AlexaLightEntity]
     guard: list[AlexaEntity]
     temperature: list[AlexaTemperatureEntity]
+    motion: list[AlexaEchoSensorEntity]
+    illuminance: list[AlexaEchoSensorEntity]
     air_quality: list[AlexaAirQualityEntity]
     aiaqm: list[AlexaAIAQMEntity]
     binary_sensor: list[AlexaBinaryEntity]
@@ -298,6 +335,8 @@ def parse_alexa_entities(
     # pylint: disable=too-many-locals
     """Turn the network details into a list of useful entities with the important details extracted."""
     temperature_sensors: list[AlexaTemperatureEntity] = []
+    motion_sensors: list[AlexaEchoSensorEntity] = []
+    illuminance_sensors: list[AlexaEchoSensorEntity] = []
     air_quality_sensors: list[AlexaAirQualityEntity] = []
     aiaqm_entities: list[AlexaAIAQMEntity] = []
     contact_sensors: list[AlexaBinaryEntity] = []
@@ -312,6 +351,8 @@ def parse_alexa_entities(
             "light": lights,
             "guard": guards,
             "temperature": temperature_sensors,
+            "motion": motion_sensors,
+            "illuminance": illuminance_sensors,
             "air_quality": air_quality_sensors,
             "aiaqm": aiaqm_entities,
             "binary_sensor": contact_sensors,
@@ -386,6 +427,20 @@ def parse_alexa_entities(
             "name": get_friendliest_name(appliance),
             "is_hue_v1": is_hue_v1(appliance),
         }
+
+        # Echo capabilities can coexist on one endpoint (including temperature).
+        # They must be discovered independently of the device-type chain below.
+        for namespace, property_name, sensors in (
+            ("Alexa.MotionSensor", "detectionState", motion_sensors),
+            ("Alexa.LightSensor", "illuminance", illuminance_sensors),
+        ):
+            if is_echo_sensor(appliance, namespace, property_name):
+                sensors.append(
+                    {
+                        **processed_appliance,
+                        "device_serial": get_device_serial(appliance),
+                    }
+                )
 
         if is_alexa_guard(appliance):
             _LOGGER.debug("Added Alexa Guard: %s", processed_appliance["name"])
@@ -548,6 +603,8 @@ def parse_alexa_entities(
         "light": lights,
         "guard": guards,
         "temperature": temperature_sensors,
+        "motion": motion_sensors,
+        "illuminance": illuminance_sensors,
         "air_quality": air_quality_sensors,
         "aiaqm": aiaqm_entities,
         "binary_sensor": contact_sensors,
