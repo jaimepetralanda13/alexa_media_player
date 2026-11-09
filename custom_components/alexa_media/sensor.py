@@ -51,7 +51,7 @@ from .const import (
     RECURRING_PATTERN,
     RECURRING_PATTERN_ISO_SET,
 )
-from .echo_sensor import EchoSensor, get_echo_client
+from .echo_sensor import EchoSensor, get_echo_client, get_echo_coordinator
 from .helpers import add_devices, alarm_just_dismissed, is_http2_enabled, safe_get
 
 _LOGGER = logging.getLogger(__name__)
@@ -151,7 +151,9 @@ async def async_setup_platform(hass, config, add_devices_callback, discovery_inf
         )
         if "Illuminance" in per_serial:
             continue
-        light_sensor = EchoLightSensor(account_dict["coordinator"], details, client)
+        light_sensor = EchoLightSensor(
+            get_echo_coordinator(hass, account_dict), details, client
+        )
         per_serial["Illuminance"] = light_sensor
         echo_light_sensors.append(light_sensor)
 

@@ -102,7 +102,7 @@ from .const import (
     STARTUP_MESSAGE,
 )
 from .coordinator import AlexaMediaCoordinator
-from .echo_sensor import get_enabled_echo_entities
+from .echo_sensor import EchoSensor
 from .exceptions import TimeoutException
 from .helpers import (
     _catch_login_errors,
@@ -1128,7 +1128,7 @@ async def setup_alexa(hass, config_entry, login_obj: AlexaLogin):
         if new_devices:
             tasks.append(AlexaAPI.get_authentication(login_obj))
 
-        entities_to_monitor = get_enabled_echo_entities(account)
+        entities_to_monitor = set()
 
         # Temperature sensors (stored as entities["sensor"][serial]["Temperature"] = sensor)
         for per_serial in hass.data[DATA_ALEXAMEDIA]["accounts"][email]["entities"][
@@ -1161,6 +1161,9 @@ async def setup_alexa(hass, config_entry, login_obj: AlexaLogin):
         for binary_sensor in hass.data[DATA_ALEXAMEDIA]["accounts"][email][
             "entities"
         ].get("binary_sensor", []):
+            # Native Echo sensors have their own lightweight one-minute poller.
+            if isinstance(binary_sensor, EchoSensor):
+                continue
             # AmazonKidsSensor is stored alongside the coordinator-backed
             # AlexaContact sensors but is not derived from an Alexa entity: it
             # polls the Echo on its own interval and has no alexa_entity_id.
@@ -3340,6 +3343,12 @@ async def async_unload_entry(hass, entry) -> bool:
     if amazon_kids:
         amazon_kids.async_stop()
         hass.data[DATA_ALEXAMEDIA]["accounts"][email]["amazon_kids"] = None
+
+    echo_sensors = hass.data[DATA_ALEXAMEDIA]["accounts"][email].pop(
+        "echo_sensor_coordinator", None
+    )
+    if echo_sensors is not None:
+        await echo_sensors.async_shutdown()
 
     for display_state in (
         hass.data[DATA_ALEXAMEDIA]["accounts"][email].get("display_states", {}).values()

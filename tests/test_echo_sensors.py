@@ -1,12 +1,24 @@
 """Tests for capability-based Echo motion and illuminance sensors."""
 
+import asyncio
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
+from alexapy import (
+    AlexapyConnectionError,
+    AlexapyLoginCloseRequested,
+    AlexapyLoginError,
+)
+from alexapy.errors import AlexapyTooManyRequestsError
+from homeassistant.helpers.update_coordinator import UpdateFailed
 import pytest
 
+import custom_components.alexa_media as alexa_media
 from custom_components.alexa_media import (
     binary_sensor as binary_sensor_platform,
+    echo_sensor as echo_sensor_module,
     sensor as sensor_platform,
 )
 from custom_components.alexa_media.alexa_entity import (
@@ -15,8 +27,9 @@ from custom_components.alexa_media.alexa_entity import (
 )
 from custom_components.alexa_media.binary_sensor import EchoMotionSensor
 from custom_components.alexa_media.echo_sensor import (
+    EchoSensorCoordinator,
     get_echo_client,
-    get_enabled_echo_entities,
+    get_echo_coordinator,
 )
 from custom_components.alexa_media.sensor import EchoLightSensor
 
@@ -359,6 +372,7 @@ def test_sensor_identity_is_account_scoped_and_reuses_device(details, client):
         sensor_a = cls(coordinator, details, client)
         sensor_b = cls(coordinator, details, other)
         assert sensor_a.unique_id != sensor_b.unique_id
+        assert sensor_a.coordinator_context == details["id"]
         assert sensor_a.device_info["identifiers"] == client.device_info["identifiers"]
         assert sensor_b.device_info["identifiers"] == other.device_info["identifiers"]
 
@@ -381,32 +395,6 @@ def test_client_lookup_rejects_unselected_echo(details, client):
         "entities": {"media_player": {"echo-garden": client}},
     }
     assert get_echo_client(account, details) is None
-
-
-def test_light_polling_does_not_depend_on_temperature():
-    """Enabled light entities must remain monitored when temperature is absent."""
-    light = SimpleNamespace(enabled=True, alexa_entity_id="endpoint-garden")
-    account = {"entities": {"sensor": {"echo-garden": {"Illuminance": light}}}}
-
-    assert set(get_enabled_echo_entities(account)) == {"endpoint-garden"}
-    light.enabled = False
-    assert set(get_enabled_echo_entities(account)) == set()
-
-
-def test_light_polling_ignores_unrelated_or_incomplete_entries():
-    """Non-Echo and partly initialized sensor records must not break polling."""
-    account = {
-        "entities": {
-            "sensor": {
-                "one": None,
-                "two": {},
-                "three": {
-                    "Temperature": SimpleNamespace(enabled=True, alexa_entity_id="temp")
-                },
-            }
-        }
-    }
-    assert set(get_enabled_echo_entities(account)) == set()
 
 
 @pytest.mark.parametrize(
@@ -443,6 +431,9 @@ async def test_platform_setup_respects_media_selection_and_is_idempotent(
         data={"alexa_media": {"accounts": {"test@example.com": account}}}
     )
     monkeypatch.setattr(binary_sensor_platform, "async_get_state", lambda *args: None)
+    monkeypatch.setattr(
+        platform, "get_echo_coordinator", lambda hass, account: account["coordinator"]
+    )
     added = []
 
     def add_entities(entities, update_before_add):
@@ -459,3 +450,395 @@ async def test_platform_setup_respects_media_selection_and_is_idempotent(
     assert all(isinstance(entity, expected_class) for entity in added)
     if selected:
         assert added[0].device_info["identifiers"] == client.device_info["identifiers"]
+
+
+def account_for_polling():
+    """Supply a synthetic authenticated account without any real credentials."""
+    return {
+        "config_entry": None,
+        "coordinator": SimpleNamespace(
+            data={"endpoint-garden": []},
+            last_update_success=True,
+            update_interval=timedelta(minutes=10),
+        ),
+        "login_obj": SimpleNamespace(
+            email="test@example.com",
+            close_requested=False,
+            session=SimpleNamespace(closed=False),
+            status={"login_successful": True},
+        ),
+    }
+
+
+def motion_response():
+    """Supply a usable response with a valid, unchanged motion sample."""
+    return {
+        "endpoint-garden": [
+            {
+                "namespace": "Alexa.MotionSensor",
+                "name": "detectionState",
+                "value": "NOT_DETECTED",
+                "timeOfSample": "2024-01-01T00:00:00Z",
+            }
+        ]
+    }
+
+
+async def test_echo_coordinator_is_per_account_and_preserves_main_interval(hass):
+    """Fast sensor refresh must neither reuse another account nor speed up media APIs."""
+    account = account_for_polling()
+    coordinator = get_echo_coordinator(hass, account)
+    other = get_echo_coordinator(hass, account_for_polling())
+    try:
+        assert get_echo_coordinator(hass, account) is coordinator
+        assert coordinator is not other
+        assert coordinator.update_interval == timedelta(seconds=60)
+        assert account["coordinator"].update_interval == timedelta(minutes=10)
+        assert coordinator.data == account["coordinator"].data
+        assert coordinator.last_update_success is True
+    finally:
+        await coordinator.async_shutdown()
+        await other.async_shutdown()
+
+
+async def test_echo_coordinator_batches_only_active_endpoints(hass, monkeypatch):
+    """Two entities on one Echo use one endpoint query, even without temperature."""
+    account = account_for_polling()
+    coordinator = EchoSensorCoordinator(hass, account)
+    response = {"endpoint-garden": [], "endpoint-hall": []}
+    fetch = AsyncMock(return_value=response)
+    monkeypatch.setattr(echo_sensor_module, "get_entity_data", fetch)
+    remove = [
+        coordinator.async_add_listener(lambda: None, context=endpoint)
+        for endpoint in ("endpoint-garden", "endpoint-garden", "endpoint-hall")
+    ]
+    try:
+        assert await coordinator._async_update_data() == response
+        fetch.assert_awaited_once()
+        login, endpoints = fetch.await_args.args
+        assert login is account["login_obj"]
+        assert set(endpoints) == {"endpoint-garden", "endpoint-hall"}
+        assert len(endpoints) == 2
+    finally:
+        for unsubscribe in remove:
+            unsubscribe()
+        await coordinator.async_shutdown()
+
+
+async def test_no_active_sensors_do_not_poll(hass, monkeypatch):
+    """A coordinator without enabled entities must perform no network requests."""
+    coordinator = EchoSensorCoordinator(hass, account_for_polling())
+    fetch = AsyncMock()
+    monkeypatch.setattr(echo_sensor_module, "get_entity_data", fetch)
+    try:
+        assert await coordinator._async_update_data() == {}
+        fetch.assert_not_awaited()
+    finally:
+        await coordinator.async_shutdown()
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing", "closing", "closed_session", "bad_auth", "missing_auth"]
+)
+async def test_unusable_login_pauses_sensor_requests(hass, monkeypatch, failure):
+    """A stale login must not generate traffic while the integration reauthenticates."""
+    account = account_for_polling()
+    if failure == "missing":
+        account["login_obj"] = None
+    elif failure == "closing":
+        account["login_obj"].close_requested = True
+    elif failure == "closed_session":
+        account["login_obj"].session.closed = True
+    elif failure == "bad_auth":
+        account["login_obj"].status["login_successful"] = False
+    else:
+        account["login_obj"].status = {}
+    coordinator = EchoSensorCoordinator(hass, account)
+    previous_update = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    coordinator.last_update = previous_update
+    fetch = AsyncMock()
+    relogin = Mock()
+    monkeypatch.setattr(echo_sensor_module, "get_entity_data", fetch)
+    monkeypatch.setattr(echo_sensor_module, "report_relogin_required", relogin)
+    unsubscribe = coordinator.async_add_listener(
+        lambda: None, context="endpoint-garden"
+    )
+    try:
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+        fetch.assert_not_awaited()
+        relogin.assert_not_called()
+        assert coordinator.update_interval == timedelta(seconds=60)
+        assert coordinator.last_update == previous_update
+    finally:
+        unsubscribe()
+        await coordinator.async_shutdown()
+
+
+@pytest.mark.parametrize("error", [AlexapyLoginError, AlexapyLoginCloseRequested])
+async def test_login_failure_is_reported_without_restarting_auth(
+    hass, monkeypatch, error
+):
+    """Sensor polling reports account errors instead of starting a separate login."""
+    account = account_for_polling()
+    coordinator = EchoSensorCoordinator(hass, account)
+    previous_update = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    coordinator.last_update = previous_update
+    fetch = AsyncMock(side_effect=error("synthetic auth failure"))
+    relogin = Mock()
+    monkeypatch.setattr(echo_sensor_module, "get_entity_data", fetch)
+    monkeypatch.setattr(echo_sensor_module, "report_relogin_required", relogin)
+    unsubscribe = coordinator.async_add_listener(
+        lambda: None, context="endpoint-garden"
+    )
+    try:
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+        fetch.assert_awaited_once()
+        assert coordinator.update_interval == timedelta(seconds=120)
+        assert coordinator.last_update == previous_update
+        if error is AlexapyLoginError:
+            relogin.assert_called_once_with(
+                hass, account["login_obj"], "test@example.com"
+            )
+        else:
+            relogin.assert_not_called()
+    finally:
+        unsubscribe()
+        await coordinator.async_shutdown()
+
+
+async def test_each_poll_uses_current_account_login(hass, monkeypatch):
+    """Reauthentication replaces credentials without rebuilding sensor entities."""
+    account = account_for_polling()
+    coordinator = EchoSensorCoordinator(hass, account)
+    fetch = AsyncMock(return_value=motion_response())
+    monkeypatch.setattr(echo_sensor_module, "get_entity_data", fetch)
+    unsubscribe = coordinator.async_add_listener(
+        lambda: None, context="endpoint-garden"
+    )
+    try:
+        first_login = account["login_obj"]
+        await coordinator._async_update_data()
+        replacement = account_for_polling()["login_obj"]
+        account["login_obj"] = replacement
+        await coordinator._async_update_data()
+        assert fetch.await_args_list[0].args[0] is first_login
+        assert fetch.await_args_list[1].args[0] is replacement
+    finally:
+        unsubscribe()
+        await coordinator.async_shutdown()
+
+
+async def test_last_unsubscribe_stops_scheduled_polling(hass, monkeypatch):
+    """Disabling or removing the last native sensor stops its refresh timer."""
+    coordinator = EchoSensorCoordinator(hass, account_for_polling())
+    fetch = AsyncMock(return_value={})
+    monkeypatch.setattr(echo_sensor_module, "get_entity_data", fetch)
+    remove_motion = coordinator.async_add_listener(
+        lambda: None, context="endpoint-garden"
+    )
+    remove_light = coordinator.async_add_listener(
+        lambda: None, context="endpoint-garden"
+    )
+    try:
+        assert coordinator._unsub_refresh is not None
+        remove_motion()
+        assert coordinator._unsub_refresh is not None
+        remove_light()
+        assert coordinator._unsub_refresh is None
+        assert list(coordinator.async_contexts()) == []
+        await coordinator._async_update_data()
+        fetch.assert_not_awaited()
+    finally:
+        await coordinator.async_shutdown()
+
+
+async def test_shutdown_cancels_inflight_sensor_request(hass, monkeypatch):
+    """Unloading the account cancels its outstanding network operation."""
+    coordinator = EchoSensorCoordinator(hass, account_for_polling())
+    previous_update = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    coordinator.last_update = previous_update
+    coordinator.update_interval = timedelta(seconds=240)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocking_fetch(*args):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    fetch = AsyncMock(side_effect=blocking_fetch)
+    monkeypatch.setattr(echo_sensor_module, "get_entity_data", fetch)
+    unsubscribe = coordinator.async_add_listener(
+        lambda: None, context="endpoint-garden"
+    )
+    refresh = asyncio.create_task(coordinator.async_refresh())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        await asyncio.wait_for(coordinator.async_shutdown(), timeout=1)
+        await asyncio.gather(refresh, return_exceptions=True)
+        assert cancelled.is_set()
+        assert coordinator.update_interval == timedelta(seconds=240)
+        assert coordinator.last_update == previous_update
+        await coordinator.async_refresh()
+        fetch.assert_awaited_once()
+    finally:
+        unsubscribe()
+        if not refresh.done():
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
+        await coordinator.async_shutdown()
+
+
+async def test_sensor_request_timeout_cancels_network_operation(hass, monkeypatch):
+    """A hung Phoenix query is bounded and releases resources for the next poll."""
+    assert echo_sensor_module.ECHO_SENSOR_REQUEST_TIMEOUT == 10
+    monkeypatch.setattr(echo_sensor_module, "ECHO_SENSOR_REQUEST_TIMEOUT", 0.001)
+    coordinator = EchoSensorCoordinator(hass, account_for_polling())
+    previous_update = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    coordinator.last_update = previous_update
+    cancelled = asyncio.Event()
+
+    async def blocking_fetch(*args):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(echo_sensor_module, "get_entity_data", blocking_fetch)
+    unsubscribe = coordinator.async_add_listener(
+        lambda: None, context="endpoint-garden"
+    )
+    try:
+        with pytest.raises(TimeoutError):
+            await coordinator._async_update_data()
+        assert cancelled.is_set()
+        assert coordinator._poll_task is None
+        assert coordinator.update_interval == timedelta(seconds=120)
+        assert coordinator.last_update == previous_update
+    finally:
+        unsubscribe()
+        await coordinator.async_shutdown()
+
+
+async def test_sensor_poll_failures_back_off_and_recover(hass, monkeypatch):
+    """Repeated failures slow requests to ten minutes until usable data returns."""
+    coordinator = EchoSensorCoordinator(hass, account_for_polling())
+    previous_update = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    coordinator.last_update = previous_update
+    fetch = AsyncMock(side_effect=AlexapyConnectionError("synthetic outage"))
+    monkeypatch.setattr(echo_sensor_module, "get_entity_data", fetch)
+    unsubscribe = coordinator.async_add_listener(
+        lambda: None, context="endpoint-garden"
+    )
+    try:
+        assert coordinator.update_interval == timedelta(seconds=60)
+        for seconds in (120, 240, 480, 600, 600, 600):
+            await coordinator.async_refresh()
+            assert coordinator.last_update_success is False
+            assert coordinator.update_interval == timedelta(seconds=seconds)
+            assert coordinator.last_update == previous_update
+
+        fetch.side_effect = None
+        fetch.return_value = motion_response()
+        await coordinator.async_refresh()
+        assert coordinator.last_update_success is True
+        assert coordinator.data == motion_response()
+        assert coordinator.update_interval == timedelta(seconds=60)
+        recovered_update = coordinator.last_update
+        assert recovered_update > previous_update
+        assert recovered_update.utcoffset() == timedelta(0)
+
+        fetch.side_effect = AlexapyConnectionError("second synthetic outage")
+        await coordinator.async_refresh()
+        assert coordinator.last_update_success is False
+        assert coordinator.update_interval == timedelta(seconds=120)
+        assert coordinator.last_update == recovered_update
+    finally:
+        unsubscribe()
+        await coordinator.async_shutdown()
+
+
+@pytest.mark.parametrize("response", [None, {}, [], ["invalid"], "invalid", 123])
+async def test_empty_or_invalid_response_does_not_advance_heartbeat(
+    hass, monkeypatch, response
+):
+    """A successful HTTP exchange without endpoint data is not a sensor update."""
+    coordinator = EchoSensorCoordinator(hass, account_for_polling())
+    previous_update = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    coordinator.last_update = previous_update
+    fetch = AsyncMock(return_value=response)
+    monkeypatch.setattr(echo_sensor_module, "get_entity_data", fetch)
+    unsubscribe = coordinator.async_add_listener(
+        lambda: None, context="endpoint-garden"
+    )
+    try:
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+        assert coordinator.last_update == previous_update
+        assert coordinator.update_interval == timedelta(seconds=120)
+        assert coordinator._poll_task is None
+    finally:
+        unsubscribe()
+        await coordinator.async_shutdown()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError, AlexapyConnectionError, AlexapyTooManyRequestsError, OSError],
+)
+async def test_request_failure_preserves_heartbeat(hass, monkeypatch, error):
+    """Connection and timeout failures cannot make cached readings look fresh."""
+    coordinator = EchoSensorCoordinator(hass, account_for_polling())
+    previous_update = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    coordinator.last_update = previous_update
+    fetch = AsyncMock(side_effect=error("synthetic request failure"))
+    monkeypatch.setattr(echo_sensor_module, "get_entity_data", fetch)
+    unsubscribe = coordinator.async_add_listener(
+        lambda: None, context="endpoint-garden"
+    )
+    try:
+        await coordinator.async_refresh()
+        assert coordinator.last_update_success is False
+        assert coordinator.last_update == previous_update
+        assert coordinator.update_interval == timedelta(seconds=120)
+        assert coordinator._poll_task is None
+        fetch.assert_awaited_once()
+    finally:
+        unsubscribe()
+        await coordinator.async_shutdown()
+
+
+async def test_account_unload_stops_sensor_polling_before_closing_login(
+    hass, monkeypatch
+):
+    """Account teardown cannot leave requests running on a session it closes."""
+    order = []
+    coordinator = SimpleNamespace(
+        async_shutdown=AsyncMock(side_effect=lambda: order.append("shutdown"))
+    )
+    other_coordinator = SimpleNamespace(async_shutdown=AsyncMock())
+    account = {"echo_sensor_coordinator": coordinator}
+    hass.data["alexa_media"] = {
+        "accounts": {
+            "test@example.com": account,
+            "other@example.com": {"echo_sensor_coordinator": other_coordinator},
+        }
+    }
+    close = AsyncMock(side_effect=lambda *_: order.append("close"))
+    monkeypatch.setattr(alexa_media, "close_connections", close)
+    monkeypatch.setattr(alexa_media, "ALEXA_COMPONENTS", [])
+    monkeypatch.setattr(alexa_media, "DEPENDENT_ALEXA_COMPONENTS", [])
+    entry = SimpleNamespace(data={"email": "test@example.com"})
+
+    assert await alexa_media.async_unload_entry(hass, entry)
+
+    assert order == ["shutdown", "close"]
+    close.assert_awaited_once_with(hass, "test@example.com")
+    coordinator.async_shutdown.assert_awaited_once()
+    other_coordinator.async_shutdown.assert_not_awaited()
+    assert "echo_sensor_coordinator" not in account
+    assert set(hass.data["alexa_media"]["accounts"]) == {"other@example.com"}

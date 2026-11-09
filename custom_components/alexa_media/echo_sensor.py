@@ -3,11 +3,134 @@
 SPDX-License-Identifier: Apache-2.0
 """
 
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta, timezone
+import logging
 from typing import Any
 
+from alexapy import (
+    AlexapyConnectionError,
+    AlexapyLoginCloseRequested,
+    AlexapyLoginError,
+)
+from alexapy.errors import AlexapyTooManyRequestsError
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.helpers.update_coordinator import (
+    CoordinatorEntity,
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
+
+from .alexa_entity import get_entity_data
+from .helpers import report_relogin_required
+
+_LOGGER = logging.getLogger(__name__)
+ECHO_SENSOR_SCAN_INTERVAL = timedelta(seconds=60)
+ECHO_SENSOR_MAX_RETRY_INTERVAL = timedelta(minutes=10)
+ECHO_SENSOR_REQUEST_TIMEOUT = 10
+
+
+def get_echo_coordinator(hass, account_dict: dict):
+    """Reuse one lightweight native-sensor poller per Alexa account."""
+    coordinator = account_dict.get("echo_sensor_coordinator")
+    if coordinator is None:
+        coordinator = EchoSensorCoordinator(hass, account_dict)
+        account_dict["echo_sensor_coordinator"] = coordinator
+    return coordinator
+
+
+class EchoSensorCoordinator(DataUpdateCoordinator):
+    """Poll only enabled native Echo sensors without refreshing the account.
+
+    Motion and light do not receive the media-player push events that slow the
+    main coordinator to ten-minute polling. Batch their active endpoint contexts
+    into one Phoenix read per minute using the integration's existing session.
+    The standard coordinator listener lifecycle stops polling when no enabled
+    entities subscribe, and the integration shuts it down before closing login.
+    Failed requests back off to ten minutes until a usable response is received.
+    """
+
+    def __init__(self, hass, account_dict: dict) -> None:
+        """Seed sensor states from network discovery without an extra request."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="alexa_media_echo_sensors",
+            config_entry=account_dict.get("config_entry"),
+            update_interval=ECHO_SENSOR_SCAN_INTERVAL,
+        )
+        self._account_dict = account_dict
+        self._poll_lock = asyncio.Lock()
+        self._poll_task = None
+        self.last_update = None
+        main = account_dict["coordinator"]
+        self.data = dict(main.data) if isinstance(main.data, dict) else {}
+        self.last_update_success = main.last_update_success
+
+    async def _async_update_data(self) -> dict:
+        """Read active sensor endpoints in one bounded request."""
+        async with self._poll_lock:
+            if self._shutdown_requested:
+                return {}
+            endpoints = sorted(set(self.async_contexts()))
+            if not endpoints:
+                return {}
+            login = self._account_dict.get("login_obj")
+            if (
+                login is None
+                or login.close_requested
+                or login.session.closed
+                or not (login.status or {}).get("login_successful")
+            ):
+                raise UpdateFailed("Alexa session is not available")
+
+            self._poll_task = asyncio.current_task()
+            try:
+                try:
+                    data = await asyncio.wait_for(
+                        get_entity_data(login, endpoints),
+                        timeout=ECHO_SENSOR_REQUEST_TIMEOUT,
+                    )
+                except AlexapyLoginCloseRequested as err:
+                    raise UpdateFailed("Alexa session is closing") from err
+                except AlexapyLoginError as err:
+                    report_relogin_required(self.hass, login, login.email)
+                    raise UpdateFailed("Alexa authentication failed") from err
+                except AlexapyTooManyRequestsError as err:
+                    raise UpdateFailed(
+                        "Alexa is limiting Echo sensor requests"
+                    ) from err
+                except AlexapyConnectionError as err:
+                    raise UpdateFailed("Unable to read Echo sensors") from err
+                if not isinstance(data, dict) or not data:
+                    # alexapy can turn an unsuccessful HTTP response into no data.
+                    # It must not advance the successful-poll heartbeat.
+                    raise UpdateFailed("No Echo sensor data received")
+            except Exception:
+                # HA schedules the next refresh using this interval. Re-raise to
+                # retain its failure handling; cancellation must bypass backoff.
+                self.update_interval = min(
+                    (self.update_interval or ECHO_SENSOR_SCAN_INTERVAL) * 2,
+                    ECHO_SENSOR_MAX_RETRY_INTERVAL,
+                )
+                raise
+            else:
+                self.update_interval = ECHO_SENSOR_SCAN_INTERVAL
+                self.last_update = datetime.now(timezone.utc)
+                return data
+            finally:
+                self._poll_task = None
+
+    async def async_shutdown(self) -> None:
+        """Stop scheduled and in-flight reads before the account is unloaded."""
+        await super().async_shutdown()
+        task = self._poll_task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 def get_echo_client(account_dict: dict, details: dict):
@@ -26,25 +149,14 @@ def get_echo_client(account_dict: dict, details: dict):
     return client
 
 
-def get_enabled_echo_entities(account_dict: dict) -> set[str]:
-    """Find light endpoints to poll even when temperature is disabled."""
-    return {
-        sensor.alexa_entity_id
-        for sensors in account_dict["entities"]["sensor"].values()
-        if isinstance(sensors, dict)
-        and (sensor := sensors.get("Illuminance")) is not None
-        and sensor.enabled
-    }
-
-
 class EchoSensor(CoordinatorEntity):
-    """A sensor read through the existing account-wide Phoenix coordinator."""
+    """A native sensor read through its account's shared lightweight poller."""
 
     _attr_has_entity_name = True
 
     def __init__(self, coordinator, entity_id: str, client, suffix: str) -> None:
         """Attach to the existing Echo without creating a second device."""
-        super().__init__(coordinator)
+        super().__init__(coordinator, context=entity_id)
         self.alexa_entity_id = entity_id
         self._client = client
         self._attr_unique_id = f"{client.unique_id}_{suffix}"
